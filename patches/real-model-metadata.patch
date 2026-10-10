@@ -1,0 +1,409 @@
+--- a/src/models.ts
++++ b/src/models.ts
+@@ -1,5 +1,8 @@
+ // Dynamic model list from CodeBuddy SDK supportedModels().
+ 
++import { readdirSync, readFileSync } from "fs";
++import { homedir } from "os";
++import { join } from "path";
+ import type { ModelInfo } from "@tencent-ai/agent-sdk";
+ 
+ export type PiModel = {
+@@ -36,19 +39,340 @@
+ 	return DEFAULT_MAX_TOKENS;
+ }
+ 
+-export function rawModelsFromSdk(supported: Array<ModelInfo & { id?: string; name?: string }>): PiModel[] {
++/**
++ * Per-model capabilities the CLI reports. The id-based heuristics below only
++ * match claude/gemini/gpt, so every CodeBuddy-hosted model would otherwise be
++ * reported as text-only even though most of them accept images.
++ */
++export type RawCapabilities = Map<string, { images?: boolean; tools?: boolean; reasoning?: boolean; thinkingLevels?: string[] }>;
++
++/**
++ * Thinking levels the model accepts.
++ *
++ * The CLI reports `reasoning.supportedEfforts` (e.g. ["low","high","max"]).
++ * When only `effort`/`defaultEffort` is present, the single level it names is
++ * still authoritative about whether thinking is configurable at all.
++ */
++function indexThinkingLevels(m: RawModelLike): string[] | undefined {
++	const reasoning = m.reasoning as
++		| { supportedEfforts?: unknown; effort?: unknown; defaultEffort?: unknown }
++		| null
++		| undefined;
++	if (!reasoning) return undefined;
++	if (Array.isArray(reasoning.supportedEfforts)) {
++		const levels = reasoning.supportedEfforts.filter((v): v is string => typeof v === "string");
++		if (levels.length) return levels;
++	}
++	if (typeof reasoning.defaultEffort === "string") return [reasoning.defaultEffort];
++	if (typeof reasoning.effort === "string") return [reasoning.effort];
++	return undefined;
++}
++
++/** Index CLI capability flags by model id. */
++export function indexRawCapabilities(raw: RawModelLike[] | undefined): RawCapabilities {
++	const out: RawCapabilities = new Map();
++	if (!Array.isArray(raw)) return out;
++	for (const m of raw) {
++		const thinkingLevels = indexThinkingLevels(m);
++		if (
++			typeof m.supportsImages !== "boolean" &&
++			typeof m.supportsToolCall !== "boolean" &&
++			typeof m.supportsReasoning !== "boolean" &&
++			thinkingLevels === undefined
++		) {
++			continue;
++		}
++		const entry = {
++			images: typeof m.supportsImages === "boolean" ? m.supportsImages : undefined,
++			tools: typeof m.supportsToolCall === "boolean" ? m.supportsToolCall : undefined,
++			reasoning:
++				typeof m.supportsReasoning === "boolean"
++					? m.supportsReasoning
++					: thinkingLevels
++						? true
++						: undefined,
++			thinkingLevels,
++		};
++		for (const key of [m.id, m.value, String(m.id ?? m.value ?? "").split("/").pop()]) {
++			if (key) out.set(key.toLowerCase(), entry);
++		}
++	}
++	return out;
++}
++
++function capabilitiesFor(caps: RawCapabilities | undefined, id: string): { images?: boolean; tools?: boolean } | undefined {
++	if (!caps || caps.size === 0) return undefined;
++	const lower = id.toLowerCase();
++	const tail = lower.split("/").pop() ?? lower;
++	return caps.get(lower) ?? caps.get(tail);
++}
++
++/**
++ * Token limits reported by the CLI/SDK for a model.
++ *
++ * `supportedModels()` only returns {value, displayName, description}, so the
++ * authoritative numbers have to come from elsewhere. Two sources, in order:
++ *
++ *  1. The CodeBuddy CLI caches its last server response under
++ *     `~/.codebuddy/local_storage/*.info`, newest-timestamp entry wins. Its
++ *     `data.models[]` carries the real `maxInputTokens` / `maxOutputTokens`.
++ *  2. `getAvailableModelsRaw()` (`RawLanguageModel.maxInputTokens`), when a
++ *     caller happens to have it.
++ *
++ * Whatever we get back is matched loosely by id so a partial or stale list
++ * still applies to the models it does cover.
++ */
++export type RawTokenLimits = Map<string, { contextWindow?: number; maxTokens?: number }>;
++
++/**
++ * Credits multipliers (CodeBuddy bills in credits, not USD) keyed by model id.
++ * The CLI reports these as strings like "x0.51 credits".
++ */
++export type RawCreditRates = Map<string, number>;
++
++type RawModelLike = {
++	id?: string;
++	value?: string;
++	maxInputTokens?: number | null;
++	maxOutputTokens?: number | null;
++	credits?: string | number | null;
++	supportsImages?: boolean;
++	supportsToolCall?: boolean;
++	supportsReasoning?: boolean;
++};
++
++/** Parse a credits multiplier such as "x0.51 credits" or "0.51" into 0.51. */
++export function parseCreditsRate(raw: string | number | null | undefined): number | undefined {
++	if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : undefined;
++	if (typeof raw !== "string") return undefined;
++	// Matches "x2.00 credits", "2.00", "x0.51" — first number in the string.
++	const match = raw.match(/(\d+(?:\.\d+)?)/);
++	if (!match) return undefined;
++	const value = Number.parseFloat(match[1]);
++	return Number.isFinite(value) && value >= 0 ? value : undefined;
++}
++
++/** Index the credits multiplier for every model, matched as loosely as token limits. */
++export function indexRawCreditRates(raw: RawModelLike[] | undefined): RawCreditRates {
++	const out: RawCreditRates = new Map();
++	if (!Array.isArray(raw)) return out;
++	for (const m of raw) {
++		const rate = parseCreditsRate(m.credits);
++		if (rate === undefined) continue;
++		for (const key of [m.id, m.value, String(m.id ?? m.value ?? "").split("/").pop()]) {
++			if (key) out.set(key.toLowerCase(), rate);
++		}
++	}
++	return out;
++}
++
++/**
++ * Credits are CodeBuddy's billing unit rather than USD. There is no published
++ * USD price per credit, so we surface the multiplier through the model *name*
++ * suffix (e.g. "DeepSeek V4 (x0.51 cr)") and leave the numeric cost fields at
++ * zero — that keeps `/model` and the footer from claiming "free" while never
++ * inventing a dollar figure we cannot compute.
++ */
++
++/** Index raw CLI/SDK model metadata by every identifier it answers to. */
++export function indexRawTokenLimits(raw: RawModelLike[] | undefined): RawTokenLimits {
++	const out: RawTokenLimits = new Map();
++	if (!Array.isArray(raw)) return out;
++	for (const m of raw) {
++		const contextWindow = typeof m.maxInputTokens === "number" && m.maxInputTokens > 0 ? m.maxInputTokens : undefined;
++		const maxTokens = typeof m.maxOutputTokens === "number" && m.maxOutputTokens > 0 ? m.maxOutputTokens : undefined;
++		if (contextWindow === undefined && maxTokens === undefined) continue;
++		const entry = { contextWindow, maxTokens };
++		// Index by the exact id plus its namespace-stripped tail ("vendor/x" -> "x")
++		// so both spellings resolve regardless of which form the CLI used.
++		for (const key of [m.id, m.value, String(m.id ?? m.value ?? "").split("/").pop()]) {
++			if (key) out.set(key.toLowerCase(), entry);
++		}
++	}
++	return out;
++}
++
++/** Look up real limits for a model id, tolerating vendor-prefixed ids. */
++export function rawLimitsFor(limits: RawTokenLimits | undefined, id: string): { contextWindow?: number; maxTokens?: number } | undefined {
++	if (!limits || limits.size === 0) return undefined;
++	const lower = id.toLowerCase();
++	const tail = lower.split("/").pop() ?? lower;
++	return limits.get(lower) ?? limits.get(tail);
++}
++
++/**
++ * Read real token limits out of the CodeBuddy CLI's local storage cache.
++ *
++ * The CLI persists its last server payload to
++ * `~/.codebuddy/local_storage/*.info` as `[{userId, data, ts}, ...]`; the
++ * entries that carry a model list have `data.models[]`. We pick the newest
++ * entry by `ts` that actually has models, so this stays correct across CLI
++ * updates and needs no network call of our own.
++ */
++export function readCliCachedTokenLimits(agentDir?: string): RawTokenLimits | undefined {
++	const models = readCliCachedModels(agentDir);
++	return models ? indexRawTokenLimits(models) : undefined;
++}
++
++/** Raw model entries from the CLI's local_storage cache, newest snapshot first. */
++function readCliCachedModels(agentDir?: string): RawModelLike[] | undefined {
++	const dir = agentDir ?? join(homedir(), ".codebuddy", "local_storage");
++	let entries: string[];
++	try {
++		entries = readdirSync(dir);
++	} catch {
++		return undefined;
++	}
++	type CacheEntry = { ts?: number; data?: { models?: unknown } };
++	let best: { ts: number; models: RawModelLike[] } | undefined;
++	for (const name of entries) {
++		if (!name.endsWith(".info")) continue;
++		let parsed: unknown;
++		try {
++			parsed = JSON.parse(readFileSync(join(dir, name), "utf-8"));
++		} catch {
++			continue;
++		}
++		for (const entry of Array.isArray(parsed) ? (parsed as CacheEntry[]) : [parsed as CacheEntry]) {
++			const models = entry?.data?.models;
++			if (!Array.isArray(models) || models.length === 0) continue;
++			const ts = typeof entry?.ts === "number" ? entry.ts : 0;
++			if (!best || ts > best.ts) best = { ts, models: models as RawModelLike[] };
++		}
++	}
++	return best?.models;
++}
++
++/**
++ * Read real token limits from the CodeBuddy CLI installation itself.
++ *
++ * `@tencent-ai/codebuddy-code/product.cloudhosted.json` ships the model table
++ * with the CLI, so it is always present and refreshes on every CLI upgrade —
++ * no local cache and no running CLI required. Used as the fallback when the
++ * local_storage cache is cold.
++ */
++export function readBundledTokenLimits(cliPackage?: string): RawTokenLimits | undefined {
++	const models = readBundledModels(cliPackage);
++	return models ? indexRawTokenLimits(models) : undefined;
++}
++
++/** Raw model entries shipped inside the CLI package. */
++function readBundledModels(cliPackage?: string): RawModelLike[] | undefined {
++	// Locate the CLI package without relying on NODE_PATH being set: walk the
++	// usual global-install locations and let the `codebuddy` on PATH point us at
++	// its own node_modules.
++	const roots: string[] = cliPackage ? [cliPackage] : [];
++	if (!cliPackage) {
++		for (const prefix of (process.env.NODE_PATH ?? "").split(":").map((p) => p.trim()).filter(Boolean)) {
++			roots.push(join(prefix, "@tencent-ai", "codebuddy-code"));
++		}
++		for (const dir of (process.env.PATH ?? "").split(":").map((p) => p.trim()).filter(Boolean)) {
++			roots.push(join(dir, "..", "lib", "node_modules", "@tencent-ai", "codebuddy-code"));
++			roots.push(join(dir, "..", "node_modules", "@tencent-ai", "codebuddy-code"));
++		}
++		roots.push(join(homedir(), ".npm-global", "lib", "node_modules", "@tencent-ai", "codebuddy-code"));
++	}
++	const candidates = ["product.cloudhosted.json", "product.json", "product.selfhosted.json"];
++	for (const root of roots) {
++		for (const file of candidates) {
++			try {
++				const parsed = JSON.parse(readFileSync(join(root, file), "utf-8"));
++				const models = parsed?.models;
++				if (Array.isArray(models) && models.length) return models as RawModelLike[];
++			} catch {
++				// Try the next candidate.
++			}
++		}
++	}
++	return undefined;
++}
++
++/**
++ * Best available token limits: live CLI cache first (freshest, reflects the
++ * account's enabled models), then the table bundled with the CLI install.
++ *
++ * Also returns the per-model credits multiplier from the same source, since it
++ * lives alongside the token limits and there is no other place to learn it.
++ */
++export function resolveRealTokenLimits(cliPackage?: string): { limits: RawTokenLimits; credits: RawCreditRates; caps: RawCapabilities } | undefined {
++	const cached = readCliCachedModels();
++	if (cached) {
++		return {
++			limits: indexRawTokenLimits(cached),
++			credits: indexRawCreditRates(cached),
++			caps: indexRawCapabilities(cached),
++		};
++	}
++	const bundled = readBundledModels(cliPackage);
++	if (bundled) {
++		return {
++			limits: indexRawTokenLimits(bundled),
++			credits: indexRawCreditRates(bundled),
++			caps: indexRawCapabilities(bundled),
++		};
++	}
++	return undefined;
++}
++
++// Pi's thinking levels are off/minimal/low/medium/high/xhigh/max/auto, while
++// CodeBuddy only understands low/high/max. We keep both sides ordered and clamp
++// each pi level up to the nearest effort the model actually accepts.
++const PI_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
++const EFFORT_ORDER = ["low", "medium", "high", "max"] as const;
++// Ordinal position of each pi level on the same scale.
++const PI_EFFORT_RANK: Record<string, number> = {
++	minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 5,
++};
++
++/** Build a pi-level -> codebuddy-effort map that clamps to what the model accepts. */
++function buildThinkingLevelMap(supported: string[]): Record<string, string> | undefined {
++	const accepted = EFFORT_ORDER.filter((e) => supported.includes(e));
++	if (!accepted.length) return undefined;
++	const map: Record<string, string> = {};
++	for (const level of PI_THINKING_LEVELS) {
++		const want = PI_EFFORT_RANK[level];
++		// Smallest accepted effort that is >= the requested level; if the model's
++		// ceiling is lower than the level, fall back to its highest effort.
++		const idx = accepted.findIndex((e) => EFFORT_ORDER.indexOf(e) >= want);
++		map[level] = idx >= 0 ? accepted[idx] : accepted[accepted.length - 1];
++	}
++	return map;
++}
++
++export function rawModelsFromSdk(
++	supported: Array<ModelInfo & { id?: string; name?: string }>,
++	real?: { limits: RawTokenLimits; credits: RawCreditRates; caps: RawCapabilities },
++): PiModel[] {
+ 	return supported
+ 		.map((m) => ({ id: m.id ?? m.value, name: m.name ?? m.displayName ?? m.id ?? m.value }))
+ 		.filter((m) => m.id)
+-		.map((m) => ({
+-		id: m.id!,
+-		name: m.name || m.id!,
+-		reasoning: detectThinking(m.id!),
+-		input: detectImages(m.id!) ? ["text", "image"] as const : ["text"] as const,
+-		contextWindow: estimateContext(m.id!),
+-		maxTokens: estimateMaxTokens(m.id!),
+-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+-	}));
++		.map((m) => {
++			const raw = rawLimitsFor(real?.limits, m.id!);
++			const rate = real?.credits.get(m.id!.toLowerCase());
++			const caps = capabilitiesFor(real?.caps, m.id!);
++			const levels = caps?.thinkingLevels;
++			const baseName = m.name || m.id!;
++			return {
++				id: m.id!,
++				// CodeBuddy bills in credits, not USD. Showing the multiplier here
++				// keeps /model from labelling every model "free" when it is not.
++				name: rate === undefined ? baseName : `${baseName} · x${rate.toFixed(2)} cr`,
++				reasoning: caps?.reasoning ?? detectThinking(m.id!),
++				// The id heuristic only recognises claude/gemini/gpt, so without the
++				// CLI's own supportsImages flag every CodeBuddy model would be
++				// reported as text-only.
++				input: (caps?.images ?? detectImages(m.id!)) ? ["text", "image"] as const : ["text"] as const,
++				// Pi offers off/minimal/low/medium/high/xhigh/max/auto while
++				// CodeBuddy only speaks low/high/max — map the levels the model
++				// actually advertises so `omp models` lists the real range.
++				thinkingLevelMap: levels ? buildThinkingLevelMap(levels) : undefined,
++				// Real CLI values win; the heuristics stay as the fallback so a
++				// CLI that withholds token limits is no worse than before.
++				contextWindow: raw?.contextWindow ?? estimateContext(m.id!),
++				maxTokens: raw?.maxTokens ?? estimateMaxTokens(m.id!),
++				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++			};
++		});
+ }
+ 
+ export const FALLBACK_MODELS: PiModel[] = [
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -9,7 +9,7 @@
+ import { homedir } from "os";
+ import { dirname, join } from "path";
+ import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+-import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
++import { buildModels, codebuddyModelId, FALLBACK_MODELS, indexRawCapabilities, indexRawCreditRates, indexRawTokenLimits, rawModelsFromSdk, resolveModel as _resolveModel, resolveRealTokenLimits, type PiModel } from "./models.js";
+ import { readModelsCache, writeModelsCache } from "./models-cache.js";
+ import { readTranscript } from "./transcript-compat.js";
+ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt } from "./skills.js";
+@@ -1692,10 +1692,34 @@
+ 		try {
+ 			q = startQuery({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
+ 			const supported = await q.supportedModels();
++			// supportedModels() drops the token limits and the credits multiplier
++			// (ModelInfo only carries value/displayName/description), so recover
++			// both from the CLI's own copy of its last server payload — its
++			// local_storage cache, else the model table bundled with the CLI, else
++			// the raw initialize response on newer builds. Everything falls back to
++			// the id-based estimates.
++			let real = resolveRealTokenLimits();
++			if (!real) {
++				try {
++					const raw = (q as any).transport?.sendControlRequest
++						? await (q as any).transport.sendControlRequest({ subtype: "initialize" })
++						: undefined;
++					const rawModels = raw?.rawModels ?? raw?.models_raw ?? raw?.raw_models;
++					if (Array.isArray(rawModels)) {
++						real = {
++							limits: indexRawTokenLimits(rawModels),
++							credits: indexRawCreditRates(rawModels),
++							caps: indexRawCapabilities(rawModels),
++						};
++					}
++				} catch {
++					// Older CLI builds may not send rawModels; fall back to estimates.
++				}
++			}
+ 			await q.return().catch(() => {});
+ 			if (!supported.length) return;
+ 			MODELS = buildModels(
+-				rawModelsFromSdk(supported as any),
++				rawModelsFromSdk(supported as any, real),
+ 				providerSettings.modelOverrides ? undefined : providerSettings,
+ 				providerSettings.modelOverrides,
+ 			);

@@ -1,0 +1,7 @@
+# local caches / runtime data (never commit)
+*.log
+node_modules/
+.DS_Store
+
+# omp runtime ledger (machine-specific)
+codebuddy-usage-ledger.json

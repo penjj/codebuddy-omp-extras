@@ -1,0 +1,11 @@
+{
+  "name": "codebuddy-usage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Track real CodeBuddy credit consumption by reading the per-request `credit` field that the CLI persists into ~/.codebuddy/traces. No network, no auth — the data is already on disk after every model call. Includes current-session attribution and a configurable quota for remaining/total math.",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
