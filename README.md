@@ -6,7 +6,8 @@ Reusable extras for driving [CodeBuddy](https://codebuddy.ai) through [oh-my-pi]
 
 - **`codebuddy-usage/`** — an omp extension that reports real CodeBuddy credit consumption by reading the per-request `credit` the CLI already persists to disk. No API keys, no network.
 - **`patches/real-model-metadata.patch`** — fixes the CodeBuddy provider's model list so every CodeBuddy-hosted model shows correct token limits, a credits multiplier, and image/reasoning capability flags (instead of being reported as text-only / "free").
-- **`docs/session-resume.md`** — how the CodeBuddy provider resumes sessions in `pi-codebuddy-sdk`, and how to debug "context lost every turn" issues.
+- **`patches/session-bare-user-resume.patch`** — fixes "every turn loses context" in omp multi-turn conversations: the host sends only the latest user message per turn, so the provider clean-started a fresh CLI session each time. The patch resumes the live session instead.
+- **`docs/session-resume.md`** — how the CodeBuddy provider resumes sessions in `pi-codebuddy-sdk`, the root-cause analysis of the context-loss bug, and how to debug it.
 
 ## Privacy
 
@@ -57,16 +58,25 @@ That `credit` is the server-computed cost — the same number you would get by "
 
 The `pi-codebuddy-sdk` provider only reports token limits and capabilities from id-based heuristics, so every CodeBuddy-hosted model shows up as text-only with `cost: 0` ("free"). This patch recovers the real values from the CLI's own copy of its last server payload (its `local_storage` cache, else the model table bundled with the CLI install).
 
-### Apply
+### Apply (both patches, in order)
 
 ```bash
 cd ~/.omp/plugins/node_modules/pi-codebuddy-sdk
-patch -p1 < /path/to/patches/real-model-metadata.patch
+patch -p1 < /path/to/patches/real-model-metadata.patch      # 1. model metadata
+patch -p1 < /path/to/patches/session-bare-user-resume.patch # 2. multi-turn context fix
 ```
 
-Re-apply after any `pi-codebuddy-sdk` update (the patch is a plain unified diff against `src/models.ts` and `src/index.ts`).
+Re-apply after any `pi-codebuddy-sdk` update (plain unified diffs against `src/`).
 
-## 3. Session resume & debugging
+## 3. Multi-turn context fix (`session-bare-user-resume.patch`)
+
+**Symptom:** in an omp conversation with a CodeBuddy model, every new message acts like the first one — the model "forgets" everything.
+
+**Root cause (verified from CLI logs, 2026-10-11):** omp sends ONLY the latest user message to the provider on normal turns (no transcript). `syncSharedSession` saw an empty history and took the clean-start path → no `--resume` flag → the CodeBuddy CLI spawned a brand-new session per turn. Special flows (title generation, session recap) DO pass the full transcript, which is why those worked while normal chat didn't. The bundled CLI inside `@tencent-ai/agent-sdk` (not the globally installed `codebuddy`) serves omp sessions, so upgrading/downgrading the global CLI changes nothing.
+
+**Fix:** when the provider receives a bare user message and already owns a live session for the cwd, resume it — the session's JSONL on disk carries the full history.
+
+## 4. Session resume internals & debugging
 
 See [`docs/session-resume.md`](docs/session-resume.md).
 

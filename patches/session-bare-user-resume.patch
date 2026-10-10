@@ -1,0 +1,27 @@
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -600,6 +600,24 @@
+ 	isReentrant?: boolean,
+ ): SyncResult {
+ 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
++
++	// Case 5 (bare-user contract): some hosts (observed with omp) send ONLY the
++	// latest user message on normal conversation turns — no transcript. With no
++	// shared session that must stay a clean start, but when we already own a live
++	// CodeBuddy session for this cwd, resume it: the session jsonl on disk
++	// carries the accumulated history (the CLI appends its own replies), so the
++	// model keeps its context instead of seeing every turn as turn one.
++	if (
++		sharedSession && !sharedSession.needsRebuild && !isReentrant &&
++		priorMessages.length === 0 && sharedSession.cwd === cwd
++	) {
++		const lastIncoming = messages[messages.length - 1] as { role?: string } | undefined;
++		if (lastIncoming?.role === "user") {
++			debug(`Case 5: bare user message (host sent no transcript) — resuming session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})`);
++			debug(`syncResult: path=reuse-bare-user sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
++			return { sessionId: sharedSession.sessionId };
++		}
++	}
+ 
+ 	// REUSE path
+ 	//

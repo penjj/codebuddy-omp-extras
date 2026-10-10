@@ -34,6 +34,49 @@ This happens when the model receives only the latest user message with no
 This resume mechanism is **unique to the CodeBuddy provider**; other providers
 (Claude / GPT) keep history natively in their own SDK / API, so they are immune.
 
+## Root cause verified (2026-10-11): the bare-user contract
+
+ omp sends **only the latest user message** to the provider on normal
+conversation turns — no transcript. Evidence, all from one repro (greeting →
+"what did you just say?"):
+
+- The CLI's own log (`~/.codebuddy/logs/<date>/<workspace>__<hash>.log`) records
+  the full argv per request. Normal turn 2 arrived **without `--resume`**, while
+  the title-generation and session-recap side queries arrived **with
+  `--resume`**.
+- The SDK spawns a fresh CLI process per request. Without `--resume` the CLI
+  creates a brand-new time-ordered session id each turn — hence "new session
+  every message".
+- `syncSharedSession` only omits `resume` when `priorMessages.length === 0`
+  (Case 1), which proves the incoming context held exactly one message.
+- The session-recap flow imports the full 4-message transcript into the session
+  and resumes it successfully — proving the resume machinery itself works when
+  the host supplies history.
+
+**Also verified:** omp sessions run on the CLI **bundled inside
+`@tencent-ai/agent-sdk`** (`cli-resolver.js` prefers the bundled copy over the
+global install). Upgrading or downgrading the globally installed
+`@tencent-ai/codebuddy-code` has no effect on omp sessions.
+
+## The fix (Case 5)
+
+`patches/session-bare-user-resume.patch` adds a case to `syncSharedSession`:
+when the incoming context is a bare user message (no transcript) and a live
+session already exists for the cwd (and the call is not reentrant), **resume
+that session** instead of clean-starting. The session's JSONL on disk carries
+the accumulated history — the CLI appends its own replies — so the model keeps
+its context.
+
+Known trade-offs:
+
+- A brand-new omp conversation started inside the same omp process would
+  wrongly resume the previous conversation's CLI session (the SDK has no
+  signal distinguishing them). omp typically runs one conversation per process,
+  so in practice this is rare.
+- omp-side history rewrites (compact, forks) that arrive as full transcripts
+  still flow through the existing REBUILD path, which rewrites the session from
+  the host's view — unchanged behavior.
+
 ## Debugging
 
 The SDK logs every decision when `CODEBUDDY_SDK_DEBUG=1`:
@@ -52,6 +95,7 @@ Interpretation:
   `sharedSession` is being reset (host reload / module re-instantiation).
 
 > Note: `syncSharedSession` lives in `pi-codebuddy-sdk`, **not** in the
-> `codebuddy-code` CLI. Rolling back the CLI changes the CLI's `resume` handling
-> but not this function — so if the bug is in the SDK, a CLI downgrade will not
-> fix it; the debug log above is what pins it down.
+> `codebuddy-code` CLI — and omp sessions don't even use the globally installed
+> CLI: `@tencent-ai/agent-sdk` spawns its own bundled copy. Downgrading the
+> global CLI changes nothing for omp. The debug log above is what pins bugs
+> down.
