@@ -320,7 +320,55 @@ function aggregate(entries: Entry[]) {
 	return { byModel, byDay, total, inT, outT, count: entries.length };
 }
 
+// ---- live status bar (shows up next to the built-in stats, no command needed) ----
+
+const STATUS_KEY = "cb-usage";
+let lastStatusRefresh = 0;
+
+/**
+ * One line for the footer status bar: current session credits, and remaining /
+ * total when a quota is configured. Returns undefined when we have nothing to
+ * show (never scanned yet, or the read failed) so we don't clobber the bar.
+ */
+function statusText(): string | undefined {
+	try {
+		const { ledger } = reconcile(false);
+		const entries = ledger.entries ?? [];
+		if (!entries.length) return "cb-usage: 未扫描 · /cb-usage scan";
+		const a = aggregate(entries);
+		const session = currentSessionCredits(entries);
+		if (ledger.quota === undefined) {
+			return `会话 ${fmt(session)} cr · 合计 ${fmt(a.total)} cr · /cb-usage quota <总积分>`;
+		}
+		const left = Math.max(0, ledger.quota - a.total);
+		return `会话 ${fmt(session)} cr · 剩余 ${fmt(left)}/${fmt(ledger.quota)} cr`;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Push the line to the status bar. Throttled: reconcile() walks the traces
+ * directory, so we don't want to run it on every single turn event.
+ */
+function refreshStatus(ctx: any, force = false): void {
+	if (!ctx?.ui?.setStatus) return;
+	const now = Date.now();
+	if (!force && now - lastStatusRefresh < 10_000) return;
+	lastStatusRefresh = now;
+	try {
+		const text = statusText();
+		if (text) ctx.ui.setStatus(STATUS_KEY, text);
+	} catch {
+		// never break a turn over a status line
+	}
+}
+
 export default function codebuddyUsage(pi: ExtensionAPI) {
+	// Keep the footer line alive across the conversation.
+	pi.on("session_start", (_event, ctx) => refreshStatus(ctx, true));
+	pi.on("turn_end", (_event, ctx) => refreshStatus(ctx));
+
 	pi.registerCommand("cb-usage", {
 		description:
 			"CodeBuddy credit consumption (reads ~/.codebuddy/traces): summary | now | total | today | model [q] | day [date] | recent [n] | quota [n] | rate | scan | clear",
@@ -535,6 +583,9 @@ export default function codebuddyUsage(pi: ExtensionAPI) {
 				report(pi, ctx, lines.join("\n"));
 			} catch (e) {
 				report(pi, ctx, `cb-usage failed: ${(e as Error)?.message ?? String(e)}`, "warning");
+			} finally {
+				// e.g. `/cb-usage quota 10000` should update the status bar right away
+				refreshStatus(ctx, true);
 			}
 		},
 	});

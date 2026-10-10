@@ -22,6 +22,25 @@ cp -r codebuddy-usage ~/.omp/agent/extensions/codebuddy-usage
 # then restart omp
 ```
 
+### Live status bar
+
+The extension also pushes a line into omp's **footer status bar** (the same row
+as the built-in `⚡ t/s` / context stats), so you see credits without typing
+anything:
+
+```
+会话 12.34 cr · 剩余 987.66/1000.00 cr
+```
+
+It refreshes on `session_start` and after each turn (throttled to once per 10s),
+and immediately after any `/cb-usage` command — so `/cb-usage quota 10000`
+updates the bar right away. Until you set a quota it reads
+`会话 … · 合计 … · /cb-usage quota <总积分>`; until the first scan it reads
+`cb-usage: 未扫描 · /cb-usage scan`.
+
+If your omp build doesn't expose `ctx.ui.setStatus`, the extension silently
+skips this and the commands below still work.
+
 ### Commands
 
 | Command | What it shows |
