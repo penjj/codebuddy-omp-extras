@@ -57,6 +57,30 @@ skips this and the commands below still work.
 | `/cb-usage scan` | Force a full re-index of trace files |
 | `/cb-usage clear` | Drop the local ledger cache |
 
+### How credits are counted (and why it's a lower bound)
+
+The `credit` for a request is **not** in its own response — it only appears
+inside `usage` blocks carried in the *next* request's `toolInput` (the full
+prompt, which replays every earlier assistant message). Two consequences:
+
+1. **Every span re-embeds all earlier credits.** Summing one credit per span
+   counts old requests over and over. An earlier version of this extension took
+   the *first* match per span and reported **2691 cr**; after de-duplicating by
+   the identity of each usage block (`inputTokens|outputTokens|cached|credit`)
+   the same data yields **76.80 cr across 577 unique calls**.
+2. **`toolInput` is truncated at ~100 KB by the CLI.** Long conversations lose
+   their later usage blocks, so recent requests are under-counted. Measured
+   coverage on a real machine: **14 579 generation spans exist, but only 577
+   distinct usage blocks survive** (~4%).
+
+So the number is a **lower bound** — fine for trend and magnitude, not a bill.
+The summary prints a warning saying so.
+
+Alternative sources checked and rejected: `toolOutput` has complete token
+counts but **no** `credit`; the CLI log records tokens only; and
+`product.cloudhosted.json` lacks the models omp actually uses (hy4-preview,
+hy3, deepseek-v4.1-flash) and doesn't state its multiplier's unit.
+
 ### Where the numbers come from
 
 Each model call the CodeBuddy CLI makes is recorded as an OpenTelemetry trace under `~/.codebuddy/traces/<pid>/trace_<id>.json`. Each trace has a `generation` span whose `toolInput` carries the real `credit` the request cost:

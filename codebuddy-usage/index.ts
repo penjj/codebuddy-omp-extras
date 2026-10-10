@@ -59,6 +59,7 @@ type Entry = {
 	inTokens: number;
 	outTokens: number;
 	file?: string; // which trace file produced this entry (kept for incremental reconcile)
+	key?: string; // identity of the underlying usage block, for de-duplication
 };
 
 type LedgerFile = {
@@ -86,27 +87,60 @@ function saveLedger(ledger: LedgerFile) {
 	}
 }
 
-/** Parse the credit + model + tokens out of a single "generation" span. */
-function parseGenerationSpan(span: any): Omit<Entry, "file"> | undefined {
-	if (!span || span.name !== "generation") return undefined;
+/** Last capture group of `re` within `s`, or undefined. */
+function lastCapture(s: string, re: RegExp): string | undefined {
+	let last: string | undefined;
+	let m: RegExpExecArray | null;
+	re.lastIndex = 0;
+	while ((m = re.exec(s)) !== null) last = m[1];
+	return last;
+}
+
+const RE_CREDIT = /"credit"\s*:\s*([0-9.]+)/g;
+const RE_IN = /"inputTokens"\s*:\s*(\d+)/g;
+const RE_OUT = /"(?:outputTokens|completion_tokens)"\s*:\s*(\d+)/g;
+const RE_CACHED = /"cached_tokens"\s*:\s*(\d+)/g;
+const RE_MODEL = /"model"\s*:\s*"([^"]+)"/g;
+
+/**
+ * Every usage block a "generation" span carries.
+ *
+ * `toolInput` is the FULL request payload, and each prior assistant message in
+ * it carries its own `usage` (with `credit`). So one span embeds the credits of
+ * every earlier request in the conversation — taking the first match (or
+ * summing every span) counts those old credits over and over. We extract all of
+ * them, tag each with the identity of its usage block, and de-duplicate
+ * globally in reconcile().
+ */
+function parseSpanUsageEntries(span: any): Omit<Entry, "file">[] {
+	if (!span || span.name !== "generation") return [];
 	const raw = typeof span.toolInput === "string" ? span.toolInput : "";
-	const src = raw || (typeof span.toolOutput === "string" ? span.toolOutput : "");
-	if (!src) return undefined;
-	const creditM = src.match(/"credit"\s*:\s*([0-9.]+)/);
-	if (!creditM) return undefined;
-	const modelM = src.match(/"model"\s*:\s*"([^"]+)"/);
-	const inM = src.match(/"inputTokens"\s*:\s*(\d+)/);
-	const outM = src.match(/"outputTokens"\s*:\s*(\d+)/);
-	const ts = parseTimestampMs(span.startedAt ?? span.endedAt);
+	if (!raw) return [];
+	const ts = parseTimestampMs(span.startedAt ?? span.endedAt) ?? 0;
 	const day = ts ? new Date(ts).toISOString().slice(0, 10) : "unknown";
-	return {
-		ts: ts ?? 0,
-		day,
-		model: modelM ? modelM[1] : "unknown",
-		credit: Number.parseFloat(creditM[1]) || 0,
-		inTokens: inM ? Number.parseInt(inM[1], 10) : 0,
-		outTokens: outM ? Number.parseInt(outM[1], 10) : 0,
-	};
+	const out: Omit<Entry, "file">[] = [];
+	let m: RegExpExecArray | null;
+	RE_CREDIT.lastIndex = 0;
+	while ((m = RE_CREDIT.exec(raw)) !== null) {
+		const credit = Number.parseFloat(m[1]);
+		if (!Number.isFinite(credit)) continue;
+		// The usage block this credit belongs to sits just before it.
+		const ahead = raw.slice(Math.max(0, m.index - 2000), m.index);
+		const it = lastCapture(ahead, RE_IN);
+		const ot = lastCapture(ahead, RE_OUT);
+		const ct = lastCapture(ahead, RE_CACHED);
+		const model = lastCapture(ahead, RE_MODEL);
+		out.push({
+			ts,
+			day,
+			model: model ?? "unknown",
+			credit,
+			inTokens: it ? Number.parseInt(it, 10) : 0,
+			outTokens: ot ? Number.parseInt(ot, 10) : 0,
+			key: `${it ?? "-"}|${ot ?? "-"}|${ct ?? "-"}|${credit}`,
+		});
+	}
+	return out;
 }
 
 /** Parse a span timestamp (epoch-ms number, or ISO string) into epoch ms. */
@@ -134,8 +168,7 @@ function scanTraceFile(path: string): Omit<Entry, "file">[] {
 	const spans = Array.isArray(parsed?.spans) ? parsed.spans : [];
 	const out: Omit<Entry, "file">[] = [];
 	for (const span of spans) {
-		const e = parseGenerationSpan(span);
-		if (e) out.push(e);
+		out.push(...parseSpanUsageEntries(span));
 	}
 	return out;
 }
@@ -205,6 +238,18 @@ function reconcile(force = false): { ledger: LedgerFile; scanned: number; newFil
 
 	// Prune file signatures no longer on disk.
 	for (const f of Object.keys(ledger.files)) if (!seen.has(f)) delete ledger.files[f];
+
+	// De-duplicate: the same usage block is embedded in the prompt of every
+	// later request, so it shows up in many spans and many files. Without this
+	// the totals are inflated several-fold (the old "first match per span"
+	// approach reported ~2700 cr where the real figure is under 100).
+	const dedup = new Map<string, Entry>();
+	for (const e of ledger.entries) {
+		const k = e.key ?? `${e.inTokens}|${e.outTokens}|${e.credit}|${e.ts}`;
+		const prev = dedup.get(k);
+		if (!prev || e.ts < prev.ts) dedup.set(k, e);
+	}
+	ledger.entries = [...dedup.values()];
 
 	saveLedger(ledger);
 	return { ledger, scanned, newFiles };
@@ -597,6 +642,11 @@ export default function codebuddyUsage(pi: ExtensionAPI) {
 					} else {
 						lines.push("", `配额: ${fmt(ledger.quota)} cr | 剩余: ${fmt(Math.max(0, ledger.quota - a.total))} cr`);
 					}
+					lines.push(
+						"",
+						"⚠️ 这是下限估算：credit 只存在于请求的 prompt 里，而该字段被 CLI 截断在约 100KB，",
+						"   长对话后期的请求积分读不到。用量级/趋势参考，别当账单。",
+					);
 				}
 				report(pi, ctx, lines.join("\n"));
 			} catch (e) {
