@@ -337,14 +337,32 @@ function statusText(): string | undefined {
 		if (!entries.length) return "cb-usage: 未扫描 · /cb-usage scan";
 		const a = aggregate(entries);
 		const session = currentSessionCredits(entries);
+		const stamp = dataStamp(entries);
 		if (ledger.quota === undefined) {
-			return `会话 ${fmt(session)} cr · 合计 ${fmt(a.total)} cr · /cb-usage quota <总积分>`;
+			return `会话 ${fmt(session)} cr · 合计 ${fmt(a.total)} cr${stamp} · /cb-usage quota <总积分>`;
 		}
 		const left = Math.max(0, ledger.quota - a.total);
-		return `会话 ${fmt(session)} cr · 剩余 ${fmt(left)}/${fmt(ledger.quota)} cr`;
+		return `会话 ${fmt(session)} cr · 剩余 ${fmt(left)}/${fmt(ledger.quota)} cr${stamp}`;
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Traces are only flushed when the CodeBuddy CLI subprocess exits, so during a
+ * long omp session the newest entry can be hours old — which makes the session
+ * figure read 0 even though credits are being spent. Surface the age instead of
+ * silently showing a stale number.
+ */
+function dataStamp(entries: Entry[]): string {
+	let newest: number | undefined;
+	for (const e of entries) {
+		if (typeof e.ts === "number" && (newest === undefined || e.ts > newest)) newest = e.ts;
+	}
+	if (newest === undefined || Date.now() - newest <= 30 * 60 * 1000) return "";
+	const d = new Date(newest);
+	const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+	return ` ·数据 ${d.getMonth() + 1}-${d.getDate()} ${hhmm}`;
 }
 
 /**

@@ -103,6 +103,48 @@ Still unfixed upstream in `pi-codebuddy-sdk@0.4.23`; the fork `@raoxxxwq/pi-code
 
 See [`docs/session-resume.md`](docs/session-resume.md).
 
+## 5. Verification (`tests/`)
+
+These load the **real** patched modules (via the SDK's exported `__test` hooks)
+and drive them with the exact event payloads omp sends — they are not
+re-implementations of the logic.
+
+```bash
+bun tests/verify-session-fix.ts     # Case 5 idle gate / cwd / reentrancy guards
+bun tests/verify-session-clear.ts   # session_start really clears the session
+bun tests/verify-status-bar.ts      # the credit line reaches ctx.ui.setStatus
+```
+
+Override the module locations with `OMP_HOME`, `CB_SDK_ENTRY`,
+`CB_USAGE_ENTRY`.
+
+### Proving the session fix, not just asserting it
+
+Running the unpatched baseline through the same test is what shows the bug was
+real. Point `CB_SDK_ENTRY` at a pristine `pi-codebuddy-sdk@0.4.19` checkout:
+
+```
+registered handlers: session_start, session_shutdown, ...   (no *_switch)
+FAIL   sharedSession cleared on session_start   {"sessionId":"STALE-prev-convo",...}
+```
+
+Same test against the patched SDK:
+
+```
+registered handlers: session_start, session_before_switch, session_switch, ...
+PASS   sharedSession cleared on session_start
+```
+
+That stale surviving session is exactly what let a new conversation resume the
+previous one's history.
+
+### Known limitation: credit data lags
+
+Traces are flushed only when the CodeBuddy CLI subprocess exits, so during a
+long omp session the newest record can be hours old and the session figure may
+read `0.00`. The status line appends `·数据 MM-DD HH:mm` whenever the newest
+entry is more than 30 minutes old, so a stale number is never shown silently.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
