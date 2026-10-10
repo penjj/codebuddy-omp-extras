@@ -1,6 +1,21 @@
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -600,6 +600,24 @@
+@@ -265,6 +265,14 @@
+ 	// this — there's no concurrent CC writer during those events, so
+ 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
+ 	forceRotate?: boolean;
++	// Wall-clock (ms) of the last syncSharedSession call that created or
++	// adopted this session. Cross-session-bleed guard: a host that sends only
++	// the bare user message hands us no transcript, so nothing proves this
++	// session still belongs to the conversation on screen. We therefore refuse
++	// to resume a session idle for longer than RESUME_MAX_IDLE_MS. Without it a
++	// stale sharedSession (see the session_start fix) makes new turns resume an
++	// unrelated older session and bleed its history into the current one.
++	lastUsedAt?: number;
+ }
+ 
+ let sharedSession: SessionState | null = null;
+@@ -600,6 +608,43 @@
  	isReentrant?: boolean,
  ): SyncResult {
  	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
@@ -17,11 +32,89 @@
 +	) {
 +		const lastIncoming = messages[messages.length - 1] as { role?: string } | undefined;
 +		if (lastIncoming?.role === "user") {
-+			debug(`Case 5: bare user message (host sent no transcript) — resuming session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor})`);
-+			debug(`syncResult: path=reuse-bare-user sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-+			return { sessionId: sharedSession.sessionId };
++			// Freshness gate. With no transcript there is nothing that proves this
++			// session is still the conversation on screen, so refuse to resume one
++			// that has gone idle: an overnight gap, a stale sharedSession, or a
++			// second window in the same cwd would otherwise make turns resume an
++			// unrelated older session and bleed its history into this one. A clean
++			// start costs context for a single turn; resuming the wrong session
++			// silently corrupts the conversation.
++			const sid = sharedSession.sessionId;
++			const idleMs = Date.now() - (sharedSession.lastUsedAt ?? 0);
++			const maxIdleMs = Number(process.env.CODEBUDDY_SDK_RESUME_MAX_IDLE_MS ?? 2 * 60 * 60 * 1000);
++			if (!sharedSession.lastUsedAt || idleMs > maxIdleMs) {
++				debug(
++					`Case 5: bare user message, but session ${sid.slice(0, 8)} idle ${Math.round(idleMs / 1000)}s > ${Math.round(maxIdleMs / 1000)}s — refusing resume (cross-session bleed guard)`,
++				);
++				debug(`syncResult: path=clean-start stale-bare-user sessionId=${sid}`);
++				sharedSession = null;
++				return { sessionId: null };
++			}
++			sharedSession = { ...sharedSession, lastUsedAt: Date.now() };
++			debug(`Case 5: bare user message (host sent no transcript) — resuming session ${sid.slice(0, 8)} (cursor=${sharedSession.cursor}, idle ${Math.round(idleMs / 1000)}s)`);
++			debug(`syncResult: path=reuse-bare-user sessionId=${sid} cursor=${sharedSession.cursor}`);
++			return { sessionId: sid };
 +		}
 +	}
  
  	// REUSE path
  	//
+@@ -614,7 +659,7 @@
+ 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
+ 		if (missed.length === 0 || trailingAssistantOnly) {
+ 			if (trailingAssistantOnly) {
+-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
++				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd, lastUsedAt: Date.now() };
+ 			}
+ 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+ 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+@@ -681,7 +726,7 @@
+ 	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+ 	session.save();
+ 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
+-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
++	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, lastUsedAt: Date.now() };
+ 	if (previousSessionId === undefined) {
+ 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
+ 	} else if (preserveId) {
+@@ -1435,7 +1480,7 @@
+ 			} else if (sessionId) {
+ 				const cursor = Math.max(convoMessages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
+ 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
+-				sharedSession = { sessionId, cursor, cwd };
++				sharedSession = { sessionId, cursor, cwd, lastUsedAt: Date.now() };
+ 			}
+ 
+ 			while (queryCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
+@@ -1817,12 +1862,27 @@
+ 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
+ 		}
+ 	};
+-	pi.on("session_start", (event, ctx) => {
++	pi.on("session_start", (_event, ctx) => {
+ 		piUI = ctx.ui;
+-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+-			clearSession(`session_start:${event.reason}`);
+-		}
++		// SessionStartEvent carries ONLY `type` — omp emits `{type:"session_start"}`
++		// with no `reason` field. The previous guard
++		// (`event.reason === "new" | "resume" | "fork"`) therefore never matched,
++		// making clearSession() dead code: sharedSession survived every session
++		// load and switch, so a later turn could resume an unrelated older
++		// session and bleed its history in. A session start is by definition the
++		// load of a conversation, so the cached session never belongs to it —
++		// always clear.
++		clearSession("session_start");
+ 	});
++	// Switching is the other path that swaps the conversation underneath us.
++	// Unlike session_start, these events DO carry `reason`
++	// ("new" | "resume" | "fork"), so keep them for attribution in the log.
++	pi.on("session_before_switch", (event) => {
++		clearSession(`session_before_switch:${event.reason}`);
++	});
++	pi.on("session_switch", (event) => {
++		clearSession(`session_switch:${event.reason}`);
++	});
+ 	pi.on("session_shutdown", () => clearSession("session_shutdown"));
+ 
+ 	pi.on("session_before_compact", async (event, ctx) => {

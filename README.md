@@ -6,7 +6,7 @@ Reusable extras for driving [CodeBuddy](https://codebuddy.ai) through [oh-my-pi]
 
 - **`codebuddy-usage/`** — an omp extension that reports real CodeBuddy credit consumption by reading the per-request `credit` the CLI already persists to disk. No API keys, no network.
 - **`patches/real-model-metadata.patch`** — fixes the CodeBuddy provider's model list so every CodeBuddy-hosted model shows correct token limits, a credits multiplier, and image/reasoning capability flags (instead of being reported as text-only / "free").
-- **`patches/session-bare-user-resume.patch`** — fixes "every turn loses context" in omp multi-turn conversations: the host sends only the latest user message per turn, so the provider clean-started a fresh CLI session each time. The patch resumes the live session instead.
+- **`patches/session-bare-user-resume.patch`** — fixes "every turn loses context" in omp multi-turn conversations: the host sends only the latest user message per turn, so the provider clean-started a fresh CLI session each time. The patch resumes the live session instead — **and** fixes the resulting cross-session bleed (`clearSession()` was dead code because `SessionStartEvent` has no `reason` field; resume is now also gated by an idle timeout).
 - **`docs/session-resume.md`** — how the CodeBuddy provider resumes sessions in `pi-codebuddy-sdk`, the root-cause analysis of the context-loss bug, and how to debug it.
 
 ## Privacy
@@ -75,6 +75,10 @@ Re-apply after any `pi-codebuddy-sdk` update (plain unified diffs against `src/`
 **Root cause (verified from CLI logs, 2026-10-11):** omp sends ONLY the latest user message to the provider on normal turns (no transcript). `syncSharedSession` saw an empty history and took the clean-start path → no `--resume` flag → the CodeBuddy CLI spawned a brand-new session per turn. Special flows (title generation, session recap) DO pass the full transcript, which is why those worked while normal chat didn't. The bundled CLI inside `@tencent-ai/agent-sdk` (not the globally installed `codebuddy`) serves omp sessions, so upgrading/downgrading the global CLI changes nothing.
 
 **Fix:** when the provider receives a bare user message and already owns a live session for the cwd, resume it — the session's JSONL on disk carries the full history.
+
+**Second bug this patch also fixes — cross-session bleed.** Resuming blindly made a *new* conversation adopt the *previous* conversation's session and import its history. Two defects: (a) the SDK's `session_start` handler gated `clearSession()` on `event.reason`, but `SessionStartEvent` carries only `type` — omp emits `{type:"session_start"}` — so the guard never fired and `sharedSession` survived every session switch; (b) with no transcript nothing proves the cached session is the one on screen. The patch clears on `session_start` / `session_before_switch` / `session_switch`, and refuses to resume a session idle longer than `CODEBUDDY_SDK_RESUME_MAX_IDLE_MS` (default 2 h).
+
+Still unfixed upstream in `pi-codebuddy-sdk@0.4.23`; the fork `@raoxxxwq/pi-codebuddy-sdk@0.7.1` shares the same code lineage and the same gap.
 
 ## 4. Session resume internals & debugging
 

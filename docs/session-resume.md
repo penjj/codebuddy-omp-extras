@@ -67,15 +67,37 @@ that session** instead of clean-starting. The session's JSONL on disk carries
 the accumulated history — the CLI appends its own replies — so the model keeps
 its context.
 
-Known trade-offs:
+### Cross-session bleed, and the second half of the fix
 
-- A brand-new omp conversation started inside the same omp process would
-  wrongly resume the previous conversation's CLI session (the SDK has no
-  signal distinguishing them). omp typically runs one conversation per process,
-  so in practice this is rare.
-- omp-side history rewrites (compact, forks) that arrive as full transcripts
-  still flow through the existing REBUILD path, which rewrites the session from
-  the host's view — unchanged behavior.
+Case 5 alone caused a worse bug: **a new conversation resumed the previous
+conversation's session and pulled its history in.** Two defects combined:
+
+1. **`clearSession()` was dead code.** The SDK's `session_start` handler gated
+   on `event.reason === "new" | "resume" | "fork"`, but `SessionStartEvent`
+   carries **only `type`** — omp literally emits `{type:"session_start"}`
+   (see `initializeExtensions` in `pi-coding-agent/dist/cli.js`). So the guard
+   never matched and `sharedSession` survived every session load and switch.
+   (`session_before_switch` / `session_switch` *do* carry `reason`; only
+   `session_start` lacks it.)
+2. **Case 5 trusted a stale `sharedSession`.** With no transcript there is
+   nothing proving the cached session is still the conversation on screen, so
+   it resumed whatever older session was lying around.
+
+The patch fixes both:
+
+- `session_start` now clears unconditionally; `session_before_switch` and
+  `session_switch` clear too (they log their `reason`).
+- Case 5 refuses to resume a session idle longer than
+  `CODEBUDDY_SDK_RESUME_MAX_IDLE_MS` (default 2 h) and falls back to a clean
+  start. Losing context for one turn beats silently importing another
+  conversation.
+
+Trade-off: an overnight gap in an otherwise continuous conversation will clean
+start once. Raise the env var if you want a longer grace period.
+
+Upstream status: still unfixed in `pi-codebuddy-sdk@0.4.23` (2026-10-11). The
+fork `@raoxxxwq/pi-codebuddy-sdk@0.7.1` shares this code lineage and has the
+same gap.
 
 ## Debugging
 
